@@ -1,0 +1,30 @@
+# Cluster registry for the MSK MCP server.
+# Each entry under `clusters:` is keyed by a cluster_id that callers pass to every tool.
+#
+# Supported auth_type values: IAM | SASL_SCRAM | MTLS
+# (POC enables IAM only; SCRAM and MTLS will raise NotImplementedError until later phases.)
+
+clusters:
+  poc-dev:
+    bootstrap_servers: b-1.poc-dev.cluster.kafka.us-east-1.amazonaws.com:9098,b-2.poc-dev.cluster.kafka.us-east-1.amazonaws.com:9098
+    region: us-east-1
+    auth_type: IAM
+    description: "POC dev cluster"
+
+  # Example SCRAM cluster (stub in POC):
+  # cust-foo-prod:
+  #   bootstrap_servers: b-1.cust-foo.cluster.kafka.us-east-1.amazonaws.com:9096,b-2...:9096
+  #   region: us-east-1
+  #   auth_type: SASL_SCRAM
+  #   scram_secret_arn: arn:aws:secretsmanager:us-east-1:123456789012:secret:msk-cust-foo-creds
+  #   description: "Customer Foo prod"
+
+  # Example mTLS cluster (stub in POC):
+  # cust-bar-prod:
+  #   bootstrap_servers: b-1.cust-bar.cluster.kafka.us-east-1.amazonaws.com:9094,b-2...:9094
+  #   region: us-east-1
+  #   auth_type: MTLS
+  #   cert_path: /etc/msk-mcp/certs/cust-bar.crt
+  #   key_path:  /etc/msk-mcp/certs/cust-bar.key
+  #   ca_path:   /etc/msk-mcp/certs/cust-bar-ca.crt
+  #   description: "Customer Bar prod"
