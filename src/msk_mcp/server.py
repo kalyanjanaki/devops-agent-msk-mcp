@@ -15,15 +15,23 @@ from msk_mcp.config import ClustersRegistry, Settings, load_registry, load_setti
 from msk_mcp.http.health import health
 from msk_mcp.kafka_clients import AdminClientFactory
 from msk_mcp.logging_setup import CorrelationIdMiddleware, configure_logging
+from msk_mcp.tools.describe_acls import describe_acls as _describe_acls
 from msk_mcp.tools.describe_cluster import describe_cluster as _describe_cluster
 from msk_mcp.tools.describe_consumer_group import (
     describe_consumer_group as _describe_consumer_group,
 )
 from msk_mcp.tools.describe_log_dirs import describe_log_dirs as _describe_log_dirs
+from msk_mcp.tools.describe_partition_reassignments import (
+    describe_partition_reassignments as _describe_partition_reassignments,
+)
 from msk_mcp.tools.describe_topic import describe_topic as _describe_topic
+from msk_mcp.tools.describe_topic_configs import (
+    describe_topic_configs as _describe_topic_configs,
+)
 from msk_mcp.tools.describe_under_replicated_partitions import (
     describe_under_replicated_partitions as _describe_under_replicated_partitions,
 )
+from msk_mcp.tools.get_offsets_for_times import get_offsets_for_times as _get_offsets_for_times
 from msk_mcp.tools.list_consumer_groups import list_consumer_groups as _list_consumer_groups
 from msk_mcp.tools.test_broker_connectivity import (
     probe_broker_connectivity as _probe_broker_connectivity,
@@ -141,6 +149,100 @@ def create_mcp(ctx: AppContext) -> FastMCP:
                 factory=ctx.factory,
                 cluster_id=cluster_id,
                 topic_filter=topic_filter,
+            ),
+            timeout=ctx.settings.default_timeout_seconds,
+        )
+
+    @mcp.tool()
+    async def describe_acls(
+        cluster_id: str,
+        resource_type: str | None = None,
+        resource_name: str | None = None,
+        principal: str | None = None,
+    ) -> dict[str, Any]:
+        """List Kafka ACLs (filtered by resource_type/name/principal if provided).
+
+        On clusters using IAM auth, permissions are managed via IAM policies and
+        Kafka ACLs are typically empty — the summary calls this out so the agent
+        doesn't waste cycles concluding ACLs are 'missing'.
+        """
+        return await ctx.bouncer.run_tool(
+            _describe_acls(
+                factory=ctx.factory,
+                registry=ctx.registry,
+                cluster_id=cluster_id,
+                resource_type=resource_type,
+                resource_name=resource_name,
+                principal=principal,
+            ),
+            timeout=ctx.settings.default_timeout_seconds,
+        )
+
+    @mcp.tool()
+    async def get_offsets_for_times(
+        cluster_id: str,
+        topic_name: str,
+        timestamp_ms: int,
+        partitions: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Find each partition's offset at a specific point in time.
+
+        Given epoch_ms (e.g. when an alarm fired), returns the offset of the
+        first message with timestamp >= timestamp_ms on each partition. Used
+        during incident timeline reconstruction: 'how far behind was the
+        consumer when the alarm fired?', 'what's the first message we need
+        to reprocess?'.
+        """
+        return await ctx.bouncer.run_tool(
+            _get_offsets_for_times(
+                factory=ctx.factory,
+                cluster_id=cluster_id,
+                topic_name=topic_name,
+                timestamp_ms=timestamp_ms,
+                partitions=partitions,
+            ),
+            timeout=ctx.settings.default_timeout_seconds,
+        )
+
+    @mcp.tool()
+    async def describe_partition_reassignments(
+        cluster_id: str,
+        topic_filter: str | None = None,
+    ) -> dict[str, Any]:
+        """In-progress partition reassignments as the controller sees them.
+
+        Direct view of the dedicated Kafka API. For each in-progress
+        reassignment returns adding_replicas / removing_replicas so the agent
+        can identify which broker pairs are moving data and spot reassignments
+        that have been queued forever (stuck).
+        """
+        return await ctx.bouncer.run_tool(
+            _describe_partition_reassignments(
+                factory=ctx.factory,
+                cluster_id=cluster_id,
+                topic_filter=topic_filter,
+            ),
+            timeout=ctx.settings.default_timeout_seconds,
+        )
+
+    @mcp.tool()
+    async def describe_topic_configs(
+        cluster_id: str,
+        topic_name: str,
+    ) -> dict[str, Any]:
+        """Topic-level configuration as the broker sees it right now.
+
+        Returns each config with its source (DYNAMIC_TOPIC_CONFIG vs DEFAULT_CONFIG
+        vs STATIC_BROKER_CONFIG) — the field MSK's control-plane Topic API doesn't
+        expose. Surfaces notable_overrides for compression.type, cleanup.policy,
+        min.insync.replicas etc. — the configs that most often cause silent
+        perf/correctness issues.
+        """
+        return await ctx.bouncer.run_tool(
+            _describe_topic_configs(
+                factory=ctx.factory,
+                cluster_id=cluster_id,
+                topic_name=topic_name,
             ),
             timeout=ctx.settings.default_timeout_seconds,
         )
