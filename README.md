@@ -2,50 +2,164 @@
 
 Read-only MCP server that exposes Amazon MSK debugging primitives to AWS DevOps Agent over Streamable HTTP. Runs as an ECS Fargate task behind a VPC Lattice service.
 
-## What it does
+## Why this exists
 
-Fills monitoring blind spots that CloudWatch metrics, Prometheus, and the MSK control plane can't cover (rebalance storms, ISR-drop attribution, stuck reassignments, etc.) by exposing Kafka AdminClient and CLI primitives as MCP tools.
+Amazon MSK's monitoring stack — CloudWatch metrics, Prometheus, MSK Topic API, control-plane APIs — can detect *that* problems exist but can't always reveal *why*. Concrete blind spots this server fills:
 
-**Strictly read-only.** No tool mutates Kafka state. Tools that would naturally mutate (e.g. resetting consumer offsets) instead return a proposed change as JSON plus the exact CLI command for a human to run.
+- CloudWatch consumer lag metrics **vanish during rebalance storms** (only emitted in STABLE/EMPTY state).
+- No metric identifies **which specific consumer instance owns a lagging partition**.
+- No metric shows **per-partition ISR membership** or which broker dropped from ISR.
+- No metric reveals **stuck partition reassignments** or disk-level errors.
+- The MSK control plane's view of topic config can **lag the live broker view**, and doesn't expose the `config_source` field needed to distinguish a topic-level override from an inherited default.
+- No metric exposes the **current Kafka controller broker ID** — the load-bearing fact during leader-election storms.
 
-## POC scope
+The 12 tools in this server answer those questions by talking directly to brokers via the Kafka AdminClient (Python `confluent-kafka` library, a thin binding over librdkafka) or by shelling out to the official Kafka CLI for the few operations the AdminClient doesn't expose cleanly.
 
-Walking-skeleton POC ships **4 tools** to exercise both execution paths end-to-end:
+## Strictly read-only
 
-| Tool | Path |
-|---|---|
-| `list_consumer_groups` | AdminClient |
-| `describe_consumer_group` | AdminClient |
-| `describe_topic` | AdminClient |
-| `describe_log_dirs` | CLI subprocess (`kafka-log-dirs.sh`) |
+No tool mutates Kafka state. Where a debugging path naturally leads to a remediation step (e.g., resetting a consumer group's offsets), the relevant tool returns the proposed change as structured JSON **and** the exact CLI command a human would run to apply it. The server itself never executes the mutation.
+
+This means the server's IAM/SCRAM/mTLS credentials can be scoped to read-only Kafka actions, eliminating a whole class of risk.
+
+## Architecture
+
+- **Execution**: Hybrid — Python AdminClient (`confluent-kafka` over librdkafka) for fast metadata calls; Kafka CLI subprocess (`kafka-log-dirs.sh`, `kafka-consumer-groups.sh --dry-run`) for the two operations where the AdminClient surface is awkward or absent.
+- **MCP SDK**: FastMCP with `transport="streamable-http"`.
+- **Auth from DevOps Agent → MCP**: VPC Lattice SigV4 at the network layer. The MCP server is plain HTTP behind Lattice; no app-layer auth needed.
+- **Auth from MCP → MSK**: IAM (live), SASL/SCRAM (stubbed), mTLS (stubbed). Per-cluster in `clusters.yaml`.
+- **Multi-cluster**: One server can serve N clusters via a registry; every tool takes a `cluster_id` parameter.
+- **Concurrency**: Two-tier asyncio bouncer — overall tool-call limit (default 16), stricter inner limit on CLI subprocesses (default 4) to cap JVM fan-out.
+- **Errors**: Structured taxonomy returned to the agent — `AUTH_FAILURE`, `NETWORK_TIMEOUT`, `AUTHORIZATION`, `INVALID_PARAMS`, `EXECUTION_FAILURE`, `TIMEOUT` — each with a `suggestion` field.
+- **Logging**: structlog JSON, with a per-request correlation ID propagated into subprocess env (`MSK_MCP_CID`) for tracing across the Python/JVM boundary.
+
+## Tools
+
+All tools take `cluster_id` (matching a key in `clusters.yaml`) as the first argument. They return JSON envelopes; on error they return `{ "error": true, "error_type": "...", "error_message": "...", "suggestion": "..." }` instead of raising.
+
+### Server-side diagnostics
+
+#### `describe_cluster`
+Live cluster topology as the brokers see it: broker list (id, host, port, rack), **current controller broker ID**, and the Kafka cluster UUID.
+
+- **Why use it**: The controller ID is the single most useful piece of info during leader-election or controller-flapping investigations. Neither CloudWatch nor MSK's control-plane API exposes it. The broker list also catches drift between MSK's declared inventory and the cluster's live membership (e.g., a broker process that's crashed but the EC2/Fargate task is still up).
+- **Args**: `cluster_id`
+
+#### `describe_topic`
+Partition layout, leader distribution, and ISR membership for a single topic.
+
+- **Why use it**: First call when a producer reports issues with a specific topic — confirms partition count, replication factor, leader-broker distribution, and which partitions (if any) are under-replicated.
+- **Args**: `cluster_id`, `topic_name`
+
+#### `describe_under_replicated_partitions`
+Scans all topics on the cluster and reports partitions where `len(isr) < len(replicas)`. Returns each affected partition's `missing_from_isr` list, plus a `broker_drop_counts` histogram across all under-replicated partitions.
+
+- **Why use it**: Answers "is broker N consistently dropping out?" in one call. The histogram makes a single misbehaving broker pop out immediately. Tolerates per-topic ACL denies — those topics are skipped, not failed.
+- **Args**: `cluster_id`, optional `topic_filter`
+
+#### `describe_log_dirs`
+Per-broker log directory sizes, with `is_future` (stuck reassignment) and per-log-dir `error` (disk failure) fields surfaced prominently.
+
+- **Why use it**: Detects size-based partition skew, stuck partition moves (`isFuture: true` + non-decreasing `offsetLag`), and disk-level failures (`KafkaStorageException`) that don't surface as Kafka-level errors. This is the only tool that goes through the CLI subprocess path.
+- **Args**: `cluster_id`, optional `broker_ids` (comma-separated), optional `topic_filter`
+
+#### `describe_partition_reassignments`
+In-progress partition reassignments as the controller sees them: `adding_replicas`, `removing_replicas`, `current_replicas` per partition.
+
+- **Why use it**: More authoritative than inferring from `describe_log_dirs.is_future`. (Note: the underlying AdminClient method `list_partition_reassignments` isn't in confluent-kafka 2.14 yet; the tool returns a clean empty response with a summary pointing to `describe_log_dirs` until that lands. Future SDK upgrade unlocks the direct path.)
+- **Args**: `cluster_id`, optional `topic_filter`
+
+### Client-side / consumer diagnostics
+
+#### `list_consumer_groups`
+List of consumer groups on the cluster, optionally filtered by state.
+
+- **Why use it**: Discovery — answer "what groups exist on this cluster?" before drilling into one.
+- **Args**: `cluster_id`, optional `state_filter` (e.g. `STABLE`, `EMPTY`, `PREPARING_REBALANCING`)
+
+#### `describe_consumer_group`
+The most diagnostic tool. Returns group state, members (with consumer host IPs and client IDs), per-member partition assignments, and per-partition `current_offset` / `log_end_offset` / `lag`. Includes an `is_rebalancing` boolean.
+
+- **Why use it**: Fills the monitoring blind spot where CloudWatch goes blind during rebalances. Surfaces which specific consumer instance is stuck (frozen `current_offset` while `log_end_offset` advances), which host owns each lagging partition, and the live group state.
+- **Args**: `cluster_id`, `group_id`, optional `include_members` (default true), optional `include_offsets` (default true)
+
+#### `get_offsets_for_times`
+Given a timestamp (epoch ms) and a topic, returns the offset of the first message at or after that timestamp on each partition. Returns `offset = -1, found = false` for partitions with no message at/after the requested time.
+
+- **Why use it**: Incident timeline reconstruction. "How far behind was the consumer when the alarm fired at 09:00 UTC?" "What's the first message we'd need to reprocess?"
+- **Args**: `cluster_id`, `topic_name`, `timestamp_ms`, optional `partitions` (list of ints)
+
+### Configuration & connectivity diagnostics
+
+#### `describe_topic_configs`
+Topic-level configuration **as the broker sees it right now**, with each config's `source` resolved to its enum name (`DYNAMIC_TOPIC_CONFIG` vs `STATIC_BROKER_CONFIG` vs `DEFAULT_CONFIG`). Surfaces a `notable_overrides` list for high-impact configs (`compression.type`, `cleanup.policy`, `min.insync.replicas`, `retention.ms`, `unclean.leader.election.enable`, etc.).
+
+- **Why use it**: The flagship use case is producer/topic compression-codec mismatches (silent CPU killer — broker decompresses and recompresses every batch). The `source` field is what answers "is this an override or inherited?", and it's not exposed by MSK's control-plane Topic API. Topics created via raw Kafka admin clients (Terraform/CDK with direct admin calls, app code) may not appear in MSK's Topic API at all — this tool always sees them.
+- **Args**: `cluster_id`, `topic_name`
+
+#### `test_broker_connectivity`
+Targeted probe of a single broker endpoint with explicit failure-stage classification: `NETWORK` | `TLS` | `SASL` | `PROTOCOL` | `null` (success).
+
+- **Why use it**: Differentiates "security group blocks me" from "my IAM policy is wrong" from "broker version too old to speak my client's wire protocol". TCP probe runs first for fast triage; on success, hands off to a single-bootstrap AdminClient for the full handshake.
+- **Args**: `cluster_id`, `broker_endpoint` (e.g. `b-1.cluster.kafka.us-east-1.amazonaws.com:9098`)
+
+#### `describe_acls`
+List Kafka ACLs with optional `resource_type` / `resource_name` / `principal` filters.
+
+- **Why use it**: Authorization-failure triage on clusters that use Kafka ACLs. On clusters using IAM auth (where permissions live in IAM policies, not Kafka ACLs), the result is typically empty — the summary explicitly calls this out so the agent doesn't conclude ACLs are 'missing'.
+- **Args**: `cluster_id`, optional `resource_type` (`TOPIC`, `GROUP`, `CLUSTER`, etc.), optional `resource_name`, optional `principal`
+
+### Remediation planning (read-only)
+
+#### `compute_offset_reset_plan`
+Computes what a consumer-group offset reset *would* do, without applying it. Always passes `--dry-run` to `kafka-consumer-groups.sh --reset-offsets`. Returns the proposed per-partition `new_offset`, plus a `remediation_command` string a human can copy-paste with `--execute` to actually apply the change.
+
+- **Why use it**: Lets the agent confidently answer "if we reset this group to earliest, what happens?" without any mutation risk. The MCP server itself never runs the `--execute` form. The output schema always sets `dry_run: true` — a contract test enforces that.
+- **Args**: `cluster_id`, `group_id`, `topic_name`, `reset_strategy` (`to-latest` | `to-earliest` | `to-offset` | `shift-by`), optional `offset_value` (required for `to-offset` and `shift-by`)
 
 ## Local development
 
 ```sh
 uv sync --extra dev
 cp config/clusters.yaml.example config/clusters.yaml
-# Edit clusters.yaml: point at a dev MSK cluster you can reach
+# Edit clusters.yaml with a dev cluster's bootstrap servers and auth_type
 ./scripts/run_local.sh
 ```
 
-The server listens on `http://localhost:8080/mcp`. Hit it with `curl` or any MCP client.
+The server listens on `http://localhost:8080/mcp`. Hit it with `curl`, the official MCP Python client, or the MCP Inspector.
+
+If you have a local Kafka CLI installed in a non-standard location:
+
+```sh
+export MSK_MCP_KAFKA_BIN_PATH=$HOME/kafka_2.13-3.8.0/bin
+export MSK_MCP_KAFKA_CLASSPATH=$HOME/kafka-libs/aws-msk-iam-auth-1.1.9-all.jar
+./scripts/run_local.sh
+```
+
+## Run tests
+
+```sh
+uv run pytest
+```
+
+132 tests covering unit (config, errors, concurrency, CLI executor, client.properties, logging) and tool integration (mocked AdminClient + mocked subprocess + in-process FastMCP wiring).
 
 ## Build & run container
 
 ```sh
-./scripts/build_image.sh
-docker run --rm -p 8080:8080 \
-  -v $(pwd)/config/clusters.yaml:/etc/msk-mcp/clusters.yaml:ro \
+./scripts/build_image.sh                # uses docker if available, else finch
+finch run -d --name msk-mcp \
+  -p 8080:8080 \
   -e AWS_REGION=us-east-1 \
-  -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... \
+  --env-file /tmp/aws-creds.env \
+  -v $(pwd)/config/clusters.yaml:/etc/msk-mcp/clusters.yaml:ro \
   msk-mcp:dev
 ```
 
-## Deployment (manual, POC)
-
-See `scripts/deploy_fargate.sh` and the [Deployment](#deployment) section below. CDK/CloudFormation is deferred until after the skeleton is validated.
+The image is `linux/amd64` by default (override with `PLATFORM=linux/arm64` for Graviton Fargate). It bundles Python 3.11, Eclipse Temurin JRE 17, Kafka 3.9.x CLI, and the `aws-msk-iam-auth` JAR. Runs as non-root user `mskmcp`.
 
 ## Configuration
+
+### Server-level env vars
 
 | Env var | Default | Notes |
 |---|---|---|
@@ -55,22 +169,74 @@ See `scripts/deploy_fargate.sh` and the [Deployment](#deployment) section below.
 | `MSK_MCP_CLI_CONCURRENCY` | `4` | Max concurrent CLI subprocesses (JVM fan-out cap) |
 | `MSK_MCP_DEFAULT_TIMEOUT_SECONDS` | `30` | Per-tool timeout |
 | `MSK_MCP_LOG_LEVEL` | `INFO` |  |
+| `MSK_MCP_KAFKA_BIN_PATH` | `/opt/kafka/bin` | Kafka CLI directory |
+| `MSK_MCP_KAFKA_CLASSPATH` | (unset) | Extra CLASSPATH for the CLI subprocess (e.g. local IAM JAR path) |
+| `MSK_MCP_CLIENT_PROPERTIES_DIR` | `/tmp/msk-mcp` | Where rendered `client.properties` files go |
 
-## Architecture
+### Per-cluster registry (`clusters.yaml`)
 
-- **Execution**: Hybrid — `confluent-kafka-python` AdminClient for fast tools; CLI subprocess for tools where the AdminClient API is awkward (`describe_log_dirs`, future `preview_offset_reset`).
-- **Auth from DevOps Agent**: VPC Lattice SigV4 at the network layer. The MCP server is plain HTTP behind Lattice.
-- **Auth to MSK**: IAM, SASL/SCRAM, mTLS (per-cluster in `clusters.yaml`). POC enables IAM only; SCRAM and mTLS are stubbed.
-- **MCP SDK**: FastMCP with `transport="streamable-http"`.
+```yaml
+clusters:
+  prod-east:
+    bootstrap_servers: b-1.prod-east.cluster.kafka.us-east-1.amazonaws.com:9098,b-2...:9098
+    region: us-east-1
+    auth_type: IAM
+    description: "Customer prod cluster, IAM auth"
 
-See `/Users/kjjanaki/.claude/plans/composed-gathering-cherny.md` for the full plan.
+  legacy-scram:
+    bootstrap_servers: b-1.legacy.cluster.kafka.us-east-1.amazonaws.com:9096
+    region: us-east-1
+    auth_type: SASL_SCRAM
+    scram_secret_arn: arn:aws:secretsmanager:us-east-1:123:secret:msk-legacy-creds
 
-## Deployment
+  cust-mtls:
+    bootstrap_servers: b-1.cust.cluster.kafka.us-east-1.amazonaws.com:9094
+    region: us-east-1
+    auth_type: MTLS
+    cert_path: /etc/msk-mcp/certs/cust.crt
+    key_path:  /etc/msk-mcp/certs/cust.key
+    ca_path:   /etc/msk-mcp/certs/cust-ca.crt
+```
+
+IAM is fully implemented. SCRAM and mTLS are stubbed in `kafka_clients.py` and `client_properties.py` — the registry shape and dispatch logic are in place; the Secrets Manager fetch / certificate plumbing is the work to lift them.
+
+## Deployment to ECS Fargate
 
 See `scripts/deploy_fargate.sh` for the manual ECR push + ECS task-def update sequence. Prerequisites:
 
 - ECR repo exists.
 - ECS cluster + Fargate service in `awsvpc` mode.
-- Task IAM role: `kafka-cluster:Connect`, `kafka-cluster:Describe*`, `kafka-cluster:ReadData` on the POC cluster ARN.
-- VPC Lattice service routes to the Fargate service (IP target type).
-- Security group allows outbound to MSK broker ports.
+- Task IAM role grants `kafka-cluster:Connect`, `kafka-cluster:Describe*`, `kafka-cluster:ReadData` on each cluster ARN in the registry. SCRAM secrets need `secretsmanager:GetSecretValue` on those secret ARNs.
+- VPC Lattice service points at the Fargate service (IP target type, port 8080). The Lattice auth policy enforces SigV4 from the DevOps Agent caller principal.
+- Security group allows outbound to MSK broker ports (9092 / 9094 / 9096 / 9098).
+- `/health` endpoint is wired for the Lattice target group (returns `200 {"status":"ok"}`).
+
+CDK / CloudFormation IaC is a follow-up task once the topology is stable.
+
+## Project layout
+
+```
+msk-devops-agent-mcp/
+├── Dockerfile                                # Multi-stage: Kafka 3.9 CLI + IAM JAR + Python deps
+├── pyproject.toml                            # Pinned deps, ruff/mypy/pytest config
+├── config/clusters.yaml.example              # Registry template (IAM, SCRAM, mTLS shapes)
+├── scripts/
+│   ├── run_local.sh                          # Local dev loop
+│   ├── build_image.sh                        # docker || finch detect
+│   └── deploy_fargate.sh                     # Manual ECR push + ECS update
+├── src/msk_mcp/
+│   ├── server.py                             # FastMCP app + Starlette wrapper + /health
+│   ├── config.py                             # Pydantic models for clusters.yaml + env vars
+│   ├── kafka_clients.py                      # AdminClient factory (IAM live; SCRAM/mTLS stubbed)
+│   ├── client_properties.py                  # Per-cluster client.properties renderer
+│   ├── cli_executor.py                       # Async subprocess (timeout, semaphore, SIGTERM/SIGKILL)
+│   ├── concurrency.py                        # Two-tier Bouncer
+│   ├── errors.py                             # Structured error taxonomy
+│   ├── logging_setup.py                      # structlog JSON + correlation-ID middleware
+│   ├── http/health.py                        # /health endpoint
+│   └── tools/                                # 12 tools, one file each
+└── tests/
+    ├── unit/                                 # Config, errors, concurrency, CLI executor, etc.
+    ├── tools/                                # Per-tool tests with mocked AdminClient / subprocess
+    └── integration/                          # In-process FastMCP server, both execution paths
+```
