@@ -15,6 +15,9 @@ from msk_mcp.config import ClustersRegistry, Settings, load_registry, load_setti
 from msk_mcp.http.health import health
 from msk_mcp.kafka_clients import AdminClientFactory
 from msk_mcp.logging_setup import CorrelationIdMiddleware, configure_logging
+from msk_mcp.tools.compute_offset_reset_plan import (
+    compute_offset_reset_plan as _compute_offset_reset_plan,
+)
 from msk_mcp.tools.describe_acls import describe_acls as _describe_acls
 from msk_mcp.tools.describe_cluster import describe_cluster as _describe_cluster
 from msk_mcp.tools.describe_consumer_group import (
@@ -264,6 +267,40 @@ def create_mcp(ctx: AppContext) -> FastMCP:
                 cluster_id=cluster_id,
                 broker_endpoint=broker_endpoint,
                 timeout=ctx.settings.default_timeout_seconds,
+            ),
+            timeout=ctx.settings.default_timeout_seconds + 5.0,
+        )
+
+    @mcp.tool()
+    async def compute_offset_reset_plan(
+        cluster_id: str,
+        group_id: str,
+        topic_name: str,
+        reset_strategy: str,
+        offset_value: int | None = None,
+    ) -> dict[str, Any]:
+        """Compute what a consumer-group offset reset WOULD do, without applying it.
+
+        Always runs `kafka-consumer-groups.sh --reset-offsets ... --dry-run` —
+        this tool NEVER mutates broker state. Returns the per-partition
+        before/after offsets and a `remediation_command` string a human can
+        copy-paste with `--execute` to actually apply the change.
+
+        reset_strategy: "to-latest" | "to-earliest" | "to-offset" | "shift-by".
+        offset_value is required for "to-offset" and "shift-by".
+        """
+        return await ctx.bouncer.run_tool(
+            _compute_offset_reset_plan(
+                registry=ctx.registry,
+                properties=ctx.properties,
+                executor=ctx.cli_executor,
+                kafka_bin_path=str(ctx.settings.kafka_bin_path),
+                timeout=ctx.settings.default_timeout_seconds,
+                cluster_id=cluster_id,
+                group_id=group_id,
+                topic_name=topic_name,
+                reset_strategy=reset_strategy,
+                offset_value=offset_value,
             ),
             timeout=ctx.settings.default_timeout_seconds + 5.0,
         )
