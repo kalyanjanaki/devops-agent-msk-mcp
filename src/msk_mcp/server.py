@@ -15,12 +15,19 @@ from msk_mcp.config import ClustersRegistry, Settings, load_registry, load_setti
 from msk_mcp.http.health import health
 from msk_mcp.kafka_clients import AdminClientFactory
 from msk_mcp.logging_setup import CorrelationIdMiddleware, configure_logging
+from msk_mcp.tools.describe_cluster import describe_cluster as _describe_cluster
 from msk_mcp.tools.describe_consumer_group import (
     describe_consumer_group as _describe_consumer_group,
 )
 from msk_mcp.tools.describe_log_dirs import describe_log_dirs as _describe_log_dirs
 from msk_mcp.tools.describe_topic import describe_topic as _describe_topic
+from msk_mcp.tools.describe_under_replicated_partitions import (
+    describe_under_replicated_partitions as _describe_under_replicated_partitions,
+)
 from msk_mcp.tools.list_consumer_groups import list_consumer_groups as _list_consumer_groups
+from msk_mcp.tools.test_broker_connectivity import (
+    probe_broker_connectivity as _probe_broker_connectivity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +109,61 @@ def create_mcp(ctx: AppContext) -> FastMCP:
                 topic_name=topic_name,
             ),
             timeout=ctx.settings.default_timeout_seconds,
+        )
+
+    @mcp.tool()
+    async def describe_cluster(cluster_id: str) -> dict[str, Any]:
+        """Live cluster topology: brokers, controller ID, cluster UUID.
+
+        Distinct from MSK control plane's view (which lags during incidents).
+        The current controller ID is critical for any leader-election or
+        controller-flapping investigation; neither CloudWatch nor MSK's API
+        exposes it.
+        """
+        return await ctx.bouncer.run_tool(
+            _describe_cluster(factory=ctx.factory, cluster_id=cluster_id),
+            timeout=ctx.settings.default_timeout_seconds,
+        )
+
+    @mcp.tool()
+    async def describe_under_replicated_partitions(
+        cluster_id: str,
+        topic_filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Find all under-replicated partitions on the cluster, with broker attribution.
+
+        For each affected partition returns missing_from_isr (which brokers dropped out),
+        plus broker_drop_counts so the agent can spot a single broker that's consistently
+        the cause across many partitions. Use during ISR-shrinkage incidents.
+        """
+        return await ctx.bouncer.run_tool(
+            _describe_under_replicated_partitions(
+                factory=ctx.factory,
+                cluster_id=cluster_id,
+                topic_filter=topic_filter,
+            ),
+            timeout=ctx.settings.default_timeout_seconds,
+        )
+
+    @mcp.tool()
+    async def test_broker_connectivity(
+        cluster_id: str,
+        broker_endpoint: str,
+    ) -> dict[str, Any]:
+        """Probe a single broker endpoint and pinpoint the failure stage.
+
+        Returns failure_stage = NETWORK | TLS | SASL | PROTOCOL | None on success.
+        Use to differentiate 'security group blocks me' from 'IAM policy is wrong'
+        from 'broker version too old' — answers each in one call.
+        """
+        return await ctx.bouncer.run_tool(
+            _probe_broker_connectivity(
+                registry=ctx.registry,
+                cluster_id=cluster_id,
+                broker_endpoint=broker_endpoint,
+                timeout=ctx.settings.default_timeout_seconds,
+            ),
+            timeout=ctx.settings.default_timeout_seconds + 5.0,
         )
 
     @mcp.tool()
