@@ -42,97 +42,147 @@ This means the server's IAM/SCRAM/mTLS credentials can be scoped to read-only Ka
 
 All tools take `cluster_id` (matching a key in `clusters.yaml`) as the first argument. They return JSON envelopes; on error they return `{ "error": true, "error_type": "...", "error_message": "...", "suggestion": "..." }` instead of raising.
 
+> Click any tool below to expand its description, typical use cases, and arguments.
+
 ### Server-side diagnostics
 
-#### `describe_cluster`
+<details>
+<summary><code>describe_cluster</code> — live broker list, controller ID, cluster UUID</summary>
+
 Live cluster topology as the brokers see it: broker list (id, host, port, rack), **current controller broker ID**, and the Kafka cluster UUID.
 
 - **Why use it**: The controller ID is the single most useful piece of info during leader-election or controller-flapping investigations. Neither CloudWatch nor MSK's control-plane API exposes it. The broker list also catches drift between MSK's declared inventory and the cluster's live membership (e.g., a broker process that's crashed but the EC2/Fargate task is still up).
 - **Typical issues it debugs**: controller flapping or instability; leader-election storms; brokers crashed at the process level but still listed as "ACTIVE" in MSK; verifying which AZs are represented after a rebalance.
 - **Args**: `cluster_id`
 
-#### `describe_topic`
+</details>
+
+<details>
+<summary><code>describe_topic</code> — partition layout, leader distribution, ISR for one topic</summary>
+
 Partition layout, leader distribution, and ISR membership for a single topic.
 
 - **Why use it**: First call when a producer reports issues with a specific topic — confirms partition count, replication factor, leader-broker distribution, and which partitions (if any) are under-replicated.
 - **Typical issues it debugs**: producer "leader not available" errors on a specific topic; uneven leader distribution (one broker hosting most partitions and getting hot); replication-factor mismatches between what was provisioned and what the brokers actually have.
 - **Args**: `cluster_id`, `topic_name`
 
-#### `describe_under_replicated_partitions`
+</details>
+
+<details>
+<summary><code>describe_under_replicated_partitions</code> — find URPs across the cluster with broker attribution</summary>
+
 Scans all topics on the cluster and reports partitions where `len(isr) < len(replicas)`. Returns each affected partition's `missing_from_isr` list, plus a `broker_drop_counts` histogram across all under-replicated partitions.
 
 - **Why use it**: Answers "is broker N consistently dropping out?" in one call. The histogram makes a single misbehaving broker pop out immediately. Tolerates per-topic ACL denies — those topics are skipped, not failed.
 - **Typical issues it debugs**: `UnderReplicatedPartitions` CloudWatch alarm firing without telling you which broker is the cause; replication lag after a broker restart; one broker silently falling behind due to disk pressure or network saturation.
 - **Args**: `cluster_id`, optional `topic_filter`
 
-#### `describe_log_dirs`
+</details>
+
+<details>
+<summary><code>describe_log_dirs</code> — per-broker disk usage, stuck reassignments, disk errors</summary>
+
 Per-broker log directory sizes, with `is_future` (stuck reassignment) and per-log-dir `error` (disk failure) fields surfaced prominently.
 
 - **Why use it**: Detects size-based partition skew, stuck partition moves (`isFuture: true` + non-decreasing `offsetLag`), and disk-level failures (`KafkaStorageException`) that don't surface as Kafka-level errors. This is the only tool that goes through the CLI subprocess path.
 - **Typical issues it debugs**: `KafkaStorageException` after a disk fault; partition reassignment that ran for hours and never finished; one broker filling up disproportionately because of leader skew; mysterious producer back-pressure that turns out to be a single broker running out of disk.
 - **Args**: `cluster_id`, optional `broker_ids` (comma-separated), optional `topic_filter`
 
-#### `describe_partition_reassignments`
+</details>
+
+<details>
+<summary><code>describe_partition_reassignments</code> — in-progress reassignments as the controller sees them</summary>
+
 In-progress partition reassignments as the controller sees them: `adding_replicas`, `removing_replicas`, `current_replicas` per partition.
 
 - **Why use it**: More authoritative than inferring from `describe_log_dirs.is_future`. (Note: the underlying AdminClient method `list_partition_reassignments` isn't in confluent-kafka 2.14 yet; the tool returns a clean empty response with a summary pointing to `describe_log_dirs` until that lands. Future SDK upgrade unlocks the direct path.)
 - **Typical issues it debugs**: a `kafka-reassign-partitions.sh` job a human kicked off hours ago that never completed; figuring out which broker pair is actively moving data when the cluster is under unusual load; confirming a reassignment finished cleanly before another one is started.
 - **Args**: `cluster_id`, optional `topic_filter`
 
+</details>
+
 ### Client-side / consumer diagnostics
 
-#### `list_consumer_groups`
+<details>
+<summary><code>list_consumer_groups</code> — discover groups on the cluster, optionally filter by state</summary>
+
 List of consumer groups on the cluster, optionally filtered by state.
 
 - **Why use it**: Discovery — answer "what groups exist on this cluster?" before drilling into one.
 - **Typical issues it debugs**: a customer asks about "the lag on our orders pipeline" without naming the actual group; spotting unexpected groups left behind by old applications; finding all groups currently in `PREPARING_REBALANCING` during an incident.
 - **Args**: `cluster_id`, optional `state_filter` (e.g. `STABLE`, `EMPTY`, `PREPARING_REBALANCING`)
 
-#### `describe_consumer_group`
+</details>
+
+<details>
+<summary><code>describe_consumer_group</code> — group state, members, per-partition lag, host attribution</summary>
+
 The most diagnostic tool. Returns group state, members (with consumer host IPs and client IDs), per-member partition assignments, and per-partition `current_offset` / `log_end_offset` / `lag`. Includes an `is_rebalancing` boolean.
 
 - **Why use it**: Fills the monitoring blind spot where CloudWatch goes blind during rebalances. Surfaces which specific consumer instance is stuck (frozen `current_offset` while `log_end_offset` advances), which host owns each lagging partition, and the live group state.
 - **Typical issues it debugs**: a rebalance storm where CloudWatch lag metrics disappear; one stuck consumer instance holding up an entire partition's progress; "consumer X is mis-deployed" — confirmed by spotting an old client_id still in the assignment; lag concentrated on specific partitions rather than spread evenly (often a hot-key issue downstream).
 - **Args**: `cluster_id`, `group_id`, optional `include_members` (default true), optional `include_offsets` (default true)
 
-#### `get_offsets_for_times`
+</details>
+
+<details>
+<summary><code>get_offsets_for_times</code> — offset on each partition at a given timestamp</summary>
+
 Given a timestamp (epoch ms) and a topic, returns the offset of the first message at or after that timestamp on each partition. Returns `offset = -1, found = false` for partitions with no message at/after the requested time.
 
 - **Why use it**: Incident timeline reconstruction. "How far behind was the consumer when the alarm fired at 09:00 UTC?" "What's the first message we'd need to reprocess?"
 - **Typical issues it debugs**: post-incident replay — "we want to reprocess everything since 14:00 UTC, what offsets is that on each partition?"; deciding whether a consumer's lag at the time of the alarm was already bad before the incident or only grew during it; identifying the message offset where a known bad event happened.
 - **Args**: `cluster_id`, `topic_name`, `timestamp_ms`, optional `partitions` (list of ints)
 
+</details>
+
 ### Configuration & connectivity diagnostics
 
-#### `describe_topic_configs`
+<details>
+<summary><code>describe_topic_configs</code> — broker-direct config view with source field (override vs default)</summary>
+
 Topic-level configuration **as the broker sees it right now**, with each config's `source` resolved to its enum name (`DYNAMIC_TOPIC_CONFIG` vs `STATIC_BROKER_CONFIG` vs `DEFAULT_CONFIG`). Surfaces a `notable_overrides` list for high-impact configs (`compression.type`, `cleanup.policy`, `min.insync.replicas`, `retention.ms`, `unclean.leader.election.enable`, etc.).
 
 - **Why use it**: The flagship use case is producer/topic compression-codec mismatches (silent CPU killer — broker decompresses and recompresses every batch). The `source` field is what answers "is this an override or inherited?", and it's not exposed by MSK's control-plane Topic API. Topics created via raw Kafka admin clients (Terraform/CDK with direct admin calls, app code) may not appear in MSK's Topic API at all — this tool always sees them.
 - **Typical issues it debugs**: producer using `compression.type=lz4` against a topic configured for `snappy` (broker CPU spike + throughput drop); a topic that is "supposed to" have 7-day retention but is silently using broker default 24-hour retention; `min.insync.replicas` set to 1 in violation of policy; topics created out-of-band that don't show up in MSK's Topic API.
 - **Args**: `cluster_id`, `topic_name`
 
-#### `test_broker_connectivity`
+</details>
+
+<details>
+<summary><code>test_broker_connectivity</code> — pinpoint NETWORK / TLS / SASL / PROTOCOL failure stage</summary>
+
 Targeted probe of a single broker endpoint with explicit failure-stage classification: `NETWORK` | `TLS` | `SASL` | `PROTOCOL` | `null` (success).
 
 - **Why use it**: Differentiates "security group blocks me" from "my IAM policy is wrong" from "broker version too old to speak my client's wire protocol". TCP probe runs first for fast triage; on success, hands off to a single-bootstrap AdminClient for the full handshake.
 - **Typical issues it debugs**: customer reports "I can't connect to MSK" — was it the security group, missing route, expired IAM token, or wrong port?; one broker reachable but another isn't (security-group rule scoped wrongly); intermittent connection failures that turn out to be TLS-handshake timeouts; producer/consumer using a port the cluster doesn't actually listen on.
 - **Args**: `cluster_id`, `broker_endpoint` (e.g. `b-1.cluster.kafka.us-east-1.amazonaws.com:9098`)
 
-#### `describe_acls`
+</details>
+
+<details>
+<summary><code>describe_acls</code> — Kafka ACL listing with resource/principal filters</summary>
+
 List Kafka ACLs with optional `resource_type` / `resource_name` / `principal` filters.
 
 - **Why use it**: Authorization-failure triage on clusters that use Kafka ACLs. On clusters using IAM auth (where permissions live in IAM policies, not Kafka ACLs), the result is typically empty — the summary explicitly calls this out so the agent doesn't conclude ACLs are 'missing'.
 - **Typical issues it debugs**: `TopicAuthorizationException` after authentication succeeded — the principal is missing READ/WRITE/DESCRIBE on the resource; a recently rotated principal whose ACLs weren't migrated; an ACL inadvertently scoped to `LITERAL` when the resource name expected `PREFIXED`.
 - **Args**: `cluster_id`, optional `resource_type` (`TOPIC`, `GROUP`, `CLUSTER`, etc.), optional `resource_name`, optional `principal`
 
+</details>
+
 ### Remediation planning (read-only)
 
-#### `compute_offset_reset_plan`
+<details>
+<summary><code>compute_offset_reset_plan</code> — preview an offset reset (dry-run only) + return the human-runnable command</summary>
+
 Computes what a consumer-group offset reset *would* do, without applying it. Always passes `--dry-run` to `kafka-consumer-groups.sh --reset-offsets`. Returns the proposed per-partition `new_offset`, plus a `remediation_command` string a human can copy-paste with `--execute` to actually apply the change.
 
 - **Why use it**: Lets the agent confidently answer "if we reset this group to earliest, what happens?" without any mutation risk. The MCP server itself never runs the `--execute` form. The output schema always sets `dry_run: true` — a contract test enforces that.
 - **Typical issues it debugs**: a consumer is wedged on a poison pill and the team needs to skip past it — what offset would `--shift-by N` actually land on per partition?; planning a "replay everything from yesterday" reset and validating the proposed new offsets before any human runs `--execute`; sanity-checking a remediation a human is about to perform during an incident.
 - **Args**: `cluster_id`, `group_id`, `topic_name`, `reset_strategy` (`to-latest` | `to-earliest` | `to-offset` | `shift-by`), optional `offset_value` (required for `to-offset` and `shift-by`)
+
+</details>
 
 ## Local development
 
