@@ -61,6 +61,11 @@ COPY src/ ./src/
 # Use pip (works under cross-arch QEMU emulation; uv segfaults there).
 RUN pip install --no-cache-dir .
 
+# Bake the cluster registry into the image. The build context must contain
+# config/clusters.yaml — copy clusters.yaml.example and edit it before building.
+# Future iteration: pull from SSM Parameter Store at task start instead.
+COPY config/clusters.yaml /etc/msk-mcp/clusters.yaml
+
 USER mskmcp
 
 ENV MSK_MCP_CLUSTERS_CONFIG_PATH=/etc/msk-mcp/clusters.yaml \

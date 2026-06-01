@@ -88,6 +88,12 @@ class Settings(BaseModel):
     # Extra CLASSPATH for the Kafka CLI subprocess (e.g. aws-msk-iam-auth uber-JAR
     # when it's not already in /opt/kafka/libs/). Empty in the container image.
     kafka_classpath: str | None = None
+    # FastMCP's StreamableHTTP transport rejects requests whose Host header is
+    # not in this list (DNS-rebinding protection). The library's defaults are
+    # localhost-only; production deployments behind Lattice/ALB need to add
+    # the public DNS or "*" (in trusted networks). Comma-separated, supports
+    # the "host:*" wildcard syntax FastMCP uses internally.
+    allowed_hosts: list[str] | None = None
 
     @model_validator(mode="after")
     def _validate_positives(self) -> Settings:
@@ -116,7 +122,14 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
             e.get("MSK_MCP_CLIENT_PROPERTIES_DIR", "/tmp/msk-mcp")
         ),
         kafka_classpath=e.get("MSK_MCP_KAFKA_CLASSPATH") or None,
+        allowed_hosts=_parse_csv(e.get("MSK_MCP_ALLOWED_HOSTS")),
     )
+
+
+def _parse_csv(s: str | None) -> list[str] | None:
+    if not s:
+        return None
+    return [item.strip() for item in s.split(",") if item.strip()]
 
 
 def _expand_path(s: str) -> Path:

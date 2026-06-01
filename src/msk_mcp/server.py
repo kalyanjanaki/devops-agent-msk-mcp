@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 
@@ -66,7 +67,8 @@ def build_context(settings: Settings | None = None) -> AppContext:
 
 
 def create_mcp(ctx: AppContext) -> FastMCP:
-    mcp = FastMCP("msk-debug")
+    transport_security = _build_transport_security(ctx.settings.allowed_hosts)
+    mcp = FastMCP("msk-debug", transport_security=transport_security)
 
     @mcp.tool()
     async def list_consumer_groups(
@@ -331,6 +333,34 @@ def create_mcp(ctx: AppContext) -> FastMCP:
         )
 
     return mcp
+
+
+def _build_transport_security(
+    allowed_hosts: list[str] | None,
+) -> TransportSecuritySettings | None:
+    """Compose a TransportSecuritySettings based on operator config.
+
+    FastMCP's defaults are localhost-only (DNS-rebinding protection on). For
+    Fargate behind a public IP / Lattice / ALB, that's too restrictive — the
+    Host header will be the public DNS or task IP that we can't predict
+    statically. Three modes:
+
+    - allowed_hosts == None or empty: use FastMCP defaults (localhost-only)
+    - allowed_hosts == ["*"]: disable DNS-rebinding protection. Access control
+      then relies entirely on network-layer gates (security group, Lattice
+      auth policy, etc.), which is the right boundary anyway in production.
+    - otherwise: keep protection on, allowlist localhost + the operator's hosts
+    """
+    if not allowed_hosts:
+        return None
+    if allowed_hosts == ["*"]:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    base = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    extra = [h for h in allowed_hosts if h not in base]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=base + extra,
+    )
 
 
 def build_app(ctx: AppContext | None = None) -> Starlette:
