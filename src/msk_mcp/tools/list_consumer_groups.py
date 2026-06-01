@@ -44,4 +44,28 @@ async def list_consumer_groups(
         "groups_with_state": groups,
         "total_count": len(groups),
         "errors": errors,
+        "summary": _summarize(len(groups), groups, state_filter, len(errors)),
     }
+
+
+def _summarize(
+    total: int,
+    groups: list[dict[str, Any]],
+    state_filter: str | None,
+    error_count: int,
+) -> str:
+    if total == 0:
+        if state_filter:
+            return f"No consumer groups in state {state_filter.upper()}"
+        return "No consumer groups on this cluster"
+    state_counts: dict[str, int] = {}
+    for g in groups:
+        key = g["state"] or "UNKNOWN"
+        state_counts[key] = state_counts.get(key, 0) + 1
+    breakdown = ", ".join(f"{c} {s}" for s, c in sorted(state_counts.items()))
+    base = f"{total} group(s): {breakdown}"
+    if state_filter:
+        base = f"{total} group(s) in state {state_filter.upper()}: {breakdown}"
+    if error_count:
+        base += f"; {error_count} listing error(s)"
+    return base
